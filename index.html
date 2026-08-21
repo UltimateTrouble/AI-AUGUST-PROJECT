@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en" class="transition-colors duration-300">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NWS Explorer: CA Edition</title>
+    
+    <!-- Load Tailwind CSS & Configure Dark Mode -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 850: '#151e2e', 900: '#0f172a' }
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Load Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    
+    <!-- Load Leaflet for Map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Load Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Custom Styles -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        
+        .hide-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .hide-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+        
+        .fade-in { animation: fadeIn 0.3s ease-in-out; }
+        .slide-up { animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(1rem); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Fix Leaflet map z-index issues with custom UI */
+        .leaflet-control-container .leaflet-top { z-index: 400 !important; }
+        .leaflet-control-container .leaflet-bottom { z-index: 400 !important; }
+    </style>
+</head>
+<body class="text-slate-800 dark:text-slate-100 bg-slate-50 dark:bg-slate-900 font-sans p-4 md:p-8 min-h-screen transition-colors duration-300">
+    
+    <!-- Main Application Container -->
+    <div id="app" class="max-w-5xl mx-auto space-y-8"></div>
+
+    <script>
+        let state = {
+            zipCode: '90401',
+            locationName: '',
+            forecast: null,
+            currentWeather: null,
+            cpcOutlooks: null,
+            alerts: [],
+            recentSearches: JSON.parse(localStorage.getItem('nws_recent_searches') || '[]'),
+            isDark: localStorage.getItem('nws_dark') === 'true',
+            unit: localStorage.getItem('nws_unit') || 'F', // 'F' or 'C'
+            loading: false,
+            error: '',
+            activeTab: 'daily',
+            selectedClimateMonth: 0,
+            mainTab: 'forecast',
+            showMap: false,
+            // Radar State
+            radarFrames: [],
+            currentRadarIndex: 0,
+            radarPlaying: false,
+            radarHost: 'https://tilecache.rainviewer.com'
+        };
+
+        // Apply Dark Mode on Load
+        if (state.isDark) document.documentElement.classList.add('dark');
+
+        // Helpers
+        const saveRecentSearch = (zip, name) => {
+            let searches = state.recentSearches.filter(s => s.zip !== zip);
+            searches.unshift({ zip, name });
+            searches = searches.slice(0, 4);
+            state.recentSearches = searches;
+            localStorage.setItem('nws_recent_searches', JSON.stringify(searches));
+        };
+
+        // Temperature conversion helper
+        window.getTemp = (tempF) => {
+            if (!tempF && tempF !== 0) return '--';
+            if (state.unit === 'C') {
+                return Math.round((tempF - 32) * 5/9);
+            }
+            return tempF;
+        };
+
+        window.parseCPCData = (tempData, precipData) => {
+            const outlooks = [];
+            const currentMonth = new Date().getMonth();
+            const currentYear = new Date().getFullYear();
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const fullMonths = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+            const extractOutlook = (result) => {
+                if (!result || !result.attributes) return { cat: 'Equal Chances', prob: null, description: 'Equal chances of above, near, or below normal conditions.' };
+                const attrs = result.attributes;
+                const cat = attrs.Cat || attrs.CAT || attrs.cat || attrs.Category || 'EC';
+                const probRaw = attrs.Prob || attrs.PROB || attrs.prob || attrs.Probability;
+                const prob = probRaw ? parseFloat(probRaw).toFixed(0) : null;
+                let formattedCat = 'Equal Chances';
+                let desc = 'Equal chances of above, near, or below normal conditions.';
+                if (cat.toUpperCase().startsWith('A')) {
+                    formattedCat = 'Above Normal';
+                    desc = `Leans toward above normal conditions (${prob}% probability).`;
+                } else if (cat.toUpperCase().startsWith('B')) {
+                    formattedCat = 'Below Normal';
+                    desc = `Leans toward below normal conditions (${prob}% probability).`;
+                } else if (cat.toUpperCase().startsWith('N')) {
+                    formattedCat = 'Near Normal';
+                    desc = `Leans toward near normal conditions (${prob}% probability).`;
+                }
+                return { cat: formattedCat, prob, description: desc };
+            };
+
+            for (let i = 0; i < 13; i++) {
+                const tResult = tempData?.results?.find(r => r.layerId === i);
+                const pResult = precipData?.results?.find(r => r.layerId === i);
+                const m1Idx = (currentMonth + 1 + i) % 12;
+                const m2Idx = (currentMonth + 2 + i) % 12;
+                const m3Idx = (currentMonth + 3 + i) % 12;
+                const yearOffset1 = Math.floor((currentMonth + 1 + i) / 12);
+                const yearOffset3 = Math.floor((currentMonth + 3 + i) / 12);
+                const shortName = `${months[m1Idx]}${months[m2Idx]}${months[m3Idx]}`;
+                const title = `${fullMonths[m1Idx]} - ${fullMonths[m3Idx]} ${currentYear + yearOffset3}`;
+                const yearRange = yearOffset1 !== yearOffset3 ? `${currentYear + yearOffset1}-${currentYear + yearOffset3}` : `${currentYear + yearOffset1}`;
+                outlooks.push({ id: i, shortName, title, year: yearRange, temp: extractOutlook(tResult), precip: extractOutlook(pResult) });
+            }
+            return outlooks;
+        };
+
+        window.getCatColor = (cat, type) => {
+            if (cat === 'Above Normal') return type === 'temp' ? 'text-red-700 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-900/30 dark:border-red-800' : 'text-teal-700 bg-teal-50 border-teal-200 dark:text-teal-400 dark:bg-teal-900/30 dark:border-teal-800';
+            if (cat === 'Below Normal') return type === 'temp' ? 'text-blue-700 bg-blue-50 border-blue-200 dark:text-blue-400 dark:bg-blue-900/30 dark:border-blue-800' : 'text-amber-700 bg-amber-50 border-amber-200 dark:text-amber-400 dark:bg-amber-900/30 dark:border-amber-800';
+            if (cat === 'Near Normal') return 'text-emerald-700 bg-emerald-50 border-emerald-200 dark:text-emerald-400 dark:bg-emerald-900/30 dark:border-emerald-800';
+            return 'text-slate-600 bg-slate-50 border-slate-200 dark:text-slate-300 dark:bg-slate-800 dark:border-slate-700'; // Equal Chances
+        };
+
+        window.setSelectedClimateMonth = (index) => {
+            state.selectedClimateMonth = index;
+            renderApp();
+        };
+
+        window.toggleTheme = () => {
+            state.isDark = !state.isDark;
+            localStorage.setItem('nws_dark', state.isDark);
+            if (state.isDark) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+            renderApp();
+            if (state.activeTab === 'hourly' && state.forecast) setTimeout(renderHourlyChart, 0);
+        };
+
+        window.toggleUnit = () => {
+            state.unit = state.unit === 'F' ? 'C' : 'F';
+            localStorage.setItem('nws_unit', state.unit);
+            renderApp();
+            if (state.activeTab === 'hourly' && state.forecast) setTimeout(renderHourlyChart, 0);
+        };
+
+        window.loadRecentSearch = (zip) => {
+            state.zipCode = zip;
+            window.handleSearch();
+        };
+
+        window.fetchRadarData = async () => {
+            try {
+                const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+                const data = await res.json();
+                state.radarHost = data.host;
+                state.radarFrames = data.radar.past; // Get past radar frames
+                state.currentRadarIndex = state.radarFrames.length - 1; // Default to most recent
+            } catch (err) {
+                console.error("Failed to load RainViewer radar data:", err);
+            }
+        };
+
+        window.updateRadarLayer = () => {
+            if (!state.showMap || !window.weatherMap || state.radarFrames.length === 0) return;
+            
+            const frame = state.radarFrames[state.currentRadarIndex];
+            const host = state.radarHost || 'https://tilecache.rainviewer.com';
+            
+            // Remove old layer
+            if (window.radarLayer) {
+                window.weatherMap.removeLayer(window.radarLayer);
+            }
+            
+            // Add new layer (opacity set based on theme). Using maxNativeZoom to fix zoom level compatibility.
+            // Color scheme 6 is NEXRAD, which matches NWS Explorer styling.
+            window.radarLayer = L.tileLayer(`${host}${frame.path}/256/{z}/{x}/{y}/6/1_1.png`, {
+                opacity: state.isDark ? 0.75 : 0.65,
+                transparent: true,
+                zIndex: 200,
+                maxNativeZoom: 12, // Prevents 404s when zooming in further than the radar source allows
+                maxZoom: 18        // Stretches the maxNativeZoom tiles across deeper zooms
+            }).addTo(window.weatherMap);
+            
+            // Update UI timestamp text
+            const tsEl = document.getElementById('radar-time');
+            if (tsEl) {
+                const d = new Date(frame.time * 1000);
+                tsEl.innerText = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+        };
+
+        window.toggleRadarPlay = () => {
+            state.radarPlaying = !state.radarPlaying;
+            const icon = document.getElementById('radar-play-icon');
+            
+            if (state.radarPlaying) {
+                if (icon) icon.className = "ph-fill ph-pause text-blue-600 dark:text-blue-400";
+                window.radarInterval = setInterval(() => {
+                    state.currentRadarIndex = (state.currentRadarIndex + 1) % state.radarFrames.length;
+                    updateRadarLayer();
+                }, 1000); // 1 frame per second
+            } else {
+                if (icon) icon.className = "ph-fill ph-play text-blue-600 dark:text-blue-400";
+                clearInterval(window.radarInterval);
+            }
+        };
+
+        window.toggleMap = async () => {
+            state.showMap = !state.showMap;
+            
+            // Stop radar if closing
+            if (!state.showMap && state.radarPlaying) {
+                window.toggleRadarPlay();
+            }
+
+            renderApp();
+
+            if (state.showMap) {
+                if (state.radarFrames.length === 0) {
+                    await fetchRadarData();
+                }
+
+                requestAnimationFrame(() => {
+                    const container = document.getElementById('map-container');
+                    if (!container) return;
+
+                    if (window.weatherMap) window.weatherMap.remove();
+                    
+                    // Center map on the United States
+                    window.weatherMap = L.map('map-container').setView([39.8283, -98.5795], 4);
+                    
+                    // Use theme-appropriate tiles
+                    const tileUrl = state.isDark 
+                        ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+                        : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+
+                    L.tileLayer(tileUrl, {
+                        attribution: '&copy; OpenStreetMap & CARTO',
+                        subdomains: 'abcd',
+                        maxZoom: 18
+                    }).addTo(window.weatherMap);
+                    
+                    window.weatherMap.on('click', function(e) {
+                        window.handleMapSearch(e.latlng.lat, e.latlng.lng);
+                    });
+
+                    updateRadarLayer();
+
+                    setTimeout(() => {
+                        if (window.weatherMap) window.weatherMap.invalidateSize();
+                    }, 250);
+                });
+            }
+        };
+
+        window.handleMapSearch = async (lat, lon) => {
+            state.loading = true;
+            state.error = '';
+            
+            if (state.radarPlaying) window.toggleRadarPlay(); // Pause radar
+            state.showMap = false;
+            renderApp();
+            
+            try {
+                const res = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
+                const data = await res.json();
+                
+                let placeName = "Selected Location";
+                let zip = "";
+                
+                if (data) {
+                    const city = data.city || data.locality || data.principalSubdivision || "";
+                    const stateAbbr = data.principalSubdivisionCode ? data.principalSubdivisionCode.split('-').pop() : "";
+                    if (city && stateAbbr) placeName = `${city}, ${stateAbbr}`;
+                    
+                    if (data.postcode) {
+                        zip = data.postcode.split('-')[0].trim().slice(0, 5);
+                        state.zipCode = zip;
+                    }
+                }
+                
+                state.locationName = placeName;
+                if (zip) saveRecentSearch(zip, placeName);
+                
+                await window.fetchWeatherForCoords(lat, lon);
+            } catch (err) {
+                state.locationName = `Location (${lat.toFixed(2)}, ${lon.toFixed(2)})`;
+                await window.fetchWeatherForCoords(lat, lon);
+            }
+        };
+
+        window.geolocateUser = () => {
+            if (!navigator.geolocation) {
+                state.error = 'Geolocation is not supported by your browser.';
+                renderApp();
+                return;
+            }
+            
+            state.loading = true;
+            state.error = '';
+            renderApp();
+
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    window.handleMapSearch(lat, lon);
+                }, 
+                (error) => {
+                    let errorMsg = 'Location access failed. Please enter your zip code manually.';
+                    if (error.code === 1) errorMsg = 'Location access denied.';
+                    state.error = errorMsg;
+                    state.loading = false;
+                    renderApp();
+                },
+                { timeout: 10000, maximumAge: 60000 }
+            );
+        };
+
+        window.fetchWeatherForCoords = async (lat, lon) => {
+            try {
+                const nwsPointsUrl = `https://api.weather.gov/points/${lat},${lon}`;
+                const alertsUrl = `https://api.weather.gov/alerts/active?point=${lat},${lon}`;
+                
+                const [pointsResponse, alertsResponse] = await Promise.all([
+                    fetch(nwsPointsUrl),
+                    fetch(alertsUrl).catch(() => ({ ok: false }))
+                ]);
+                
+                if (!pointsResponse.ok) throw new Error('Weather data not available for this location via NWS.');
+                const pointsData = await pointsResponse.json();
+
+                if (alertsResponse.ok) {
+                    const alertsData = await alertsResponse.json();
+                    state.alerts = alertsData.features.map(f => ({
+                        event: f.properties.event || 'Weather Alert',
+                        severity: f.properties.severity || 'Unknown',
+                        desc: f.properties.description || f.properties.instruction || 'No further details provided.',
+                        headline: f.properties.headline || f.properties.event
+                    }));
+                }
+
+                const forecastUrl = pointsData.properties.forecast;
+                const forecastHourlyUrl = pointsData.properties.forecastHourly;
+
+                const extent = `${lon-0.5},${lat-0.5},${lon+0.5},${lat+0.5}`;
+                const cpcParams = new URLSearchParams({
+                    geometry: `${lon},${lat}`,
+                    geometryType: 'esriGeometryPoint',
+                    sr: '4326',
+                    layers: 'all',
+                    tolerance: '2',
+                    mapExtent: extent,
+                    imageDisplay: '800,600,96',
+                    returnGeometry: 'false',
+                    f: 'json'
+                }).toString();
+
+                const cpcTempUrl = `https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_sea_temp_outlk/MapServer/identify?${cpcParams}`;
+                const cpcPrecipUrl = `https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_sea_precip_outlk/MapServer/identify?${cpcParams}`;
+
+                const [forecastRes, hourlyRes, cpcTempRes, cpcPrecipRes] = await Promise.all([
+                    fetch(forecastUrl),
+                    fetch(forecastHourlyUrl),
+                    fetch(cpcTempUrl).catch(() => ({ ok: false })),
+                    fetch(cpcPrecipUrl).catch(() => ({ ok: false }))
+                ]);
+
+                if (!forecastRes.ok || !hourlyRes.ok) throw new Error('Failed to retrieve forecast data.');
+
+                const forecastData = await forecastRes.json();
+                const hourlyData = await hourlyRes.json();
+                
+                if (cpcTempRes.ok && cpcPrecipRes.ok) {
+                    try {
+                        const tempData = await cpcTempRes.json();
+                        const precipData = await cpcPrecipRes.json();
+                        state.cpcOutlooks = window.parseCPCData(tempData, precipData);
+                    } catch(e) {
+                        state.cpcOutlooks = null;
+                    }
+                } else {
+                    state.cpcOutlooks = null;
+                }
+
+                state.forecast = {
+                    daily: forecastData.properties.periods,
+                    hourly: hourlyData.properties.periods.slice(0, 24)
+                };
+                state.currentWeather = hourlyData.properties.periods[0];
+
+            } catch (err) {
+                state.error = err.message || 'An unexpected error occurred.';
+            } finally {
+                state.loading = false;
+                renderApp();
+                if (state.activeTab === 'hourly') setTimeout(renderHourlyChart, 0);
+            }
+        };
+
+        window.handleSearch = async (e) => {
+            if (e) e.preventDefault();
+            const inputEl = document.getElementById('zip-input');
+            if (inputEl) state.zipCode = inputEl.value.replace(/\D/g, '').slice(0, 5);
+
+            if (!state.zipCode || state.zipCode.length !== 5) {
+                state.error = 'Please enter a valid 5-digit US zip code.';
+                renderApp();
+                return;
+            }
+
+            state.loading = true;
+            state.error = '';
+            state.forecast = null;
+            state.currentWeather = null;
+            state.alerts = [];
+            state.showMap = false;
+            renderApp();
+
+            try {
+                const geoResponse = await fetch(`https://api.zippopotam.us/us/${state.zipCode}`);
+                if (!geoResponse.ok) throw new Error('Zip code not found.');
+                const geoData = await geoResponse.json();
+                
+                state.locationName = `${geoData.places[0]['place name']}, ${geoData.places[0]['state abbreviation']}`;
+                saveRecentSearch(state.zipCode, state.locationName);
+
+                await window.fetchWeatherForCoords(geoData.places[0].latitude, geoData.places[0].longitude);
+            } catch (err) {
+                state.error = err.message || 'An unexpected error occurred.';
+                state.loading = false;
+                renderApp();
+            }
+        };
+
+        window.hourlyChartInstance = null;
+        window.renderHourlyChart = () => {
+            const ctx = document.getElementById('hourlyChartCanvas');
+            if (!ctx || !state.forecast || !state.forecast.hourly) return;
+            
+            if (window.hourlyChartInstance) {
+                window.hourlyChartInstance.destroy();
+            }
+            
+            const data = state.forecast.hourly;
+            const labels = data.map((d, i) => i === 0 ? 'Now' : new Date(d.startTime).toLocaleTimeString([], {hour: 'numeric'}));
+            const temps = data.map(d => window.getTemp(d.temperature));
+            
+            // Define colors based on theme
+            const textColor = state.isDark ? '#cbd5e1' : '#64748b';
+            const gridColor = state.isDark ? '#334155' : '#f1f5f9';
+            const lineColor = state.isDark ? '#60a5fa' : '#3b82f6'; // Tailwind blue-400 : blue-500
+            
+            // Create a gradient for the fill area
+            const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 300);
+            if (state.isDark) {
+                gradient.addColorStop(0, 'rgba(96, 165, 250, 0.4)');
+                gradient.addColorStop(1, 'rgba(96, 165, 250, 0.0)');
+            } else {
+                gradient.addColorStop(0, 'rgba(59, 130, 246, 0.3)');
+                gradient.addColorStop(1, 'rgba(59, 130, 246, 0.0)');
+            }
+
+            window.hourlyChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: `Temperature (°${state.unit})`,
+                        data: temps,
+                        borderColor: lineColor,
+                        backgroundColor: gradient,
+                        fill: true,
+                        tension: 0.4, // Smooth curve
+                        pointRadius: 4,
+                        pointBackgroundColor: state.isDark ? '#1e293b' : '#fff',
+                        pointBorderColor: lineColor,
+                        pointBorderWidth: 2,
+                        pointHoverRadius: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: state.isDark ? '#1e293b' : '#fff',
+                            titleColor: state.isDark ? '#f8fafc' : '#0f172a',
+                            bodyColor: state.isDark ? '#cbd5e1' : '#475569',
+                            borderColor: state.isDark ? '#334155' : '#e2e8f0',
+                            borderWidth: 1,
+                            padding: 10,
+                            displayColors: false,
+                            callbacks: {
+                                label: (context) => `${context.parsed.y}°${state.unit}`
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            ticks: { color: textColor, font: { family: 'Inter', weight: 600 } },
+                            grid: { color: gridColor, drawBorder: false },
+                            suggestedMin: Math.min(...temps) - 5,
+                            suggestedMax: Math.max(...temps) + 5
+                        },
+                        x: {
+                            ticks: { color: textColor, font: { family: 'Inter' } },
+                            grid: { display: false, drawBorder: false }
+                        }
+                    }
+                }
+            });
+        };
+
+        window.setMainTab = (tab) => { state.mainTab = tab; renderApp(); };
+        window.setActiveTab = (tab) => { 
+            state.activeTab = tab; 
+            renderApp();
+            if (tab === 'hourly') setTimeout(renderHourlyChart, 0); 
+        };
+        
+        window.toggleAlertDetails = (index) => {
+            const el = document.getElementById(`alert-desc-${index}`);
+            const icon = document.getElementById(`alert-icon-${index}`);
+            if (el.classList.contains('hidden')) {
+                el.classList.remove('hidden');
+                icon.classList.replace('ph-caret-down', 'ph-caret-up');
+            } else {
+                el.classList.add('hidden');
+                icon.classList.replace('ph-caret-up', 'ph-caret-down');
+            }
+        };
+
+        const getWeatherIconHTML = (shortForecast, isDaytime = true) => {
+            if (!shortForecast) return '';
+            const forecast = shortForecast.toLowerCase();
+            if (forecast.includes('rain') || forecast.includes('shower') || forecast.includes('drizzle')) return `<i class="ph-fill ph-cloud-rain text-blue-500 text-[2rem]"></i>`;
+            if (forecast.includes('thunder')) return `<i class="ph-fill ph-cloud-lightning text-yellow-500 text-[2rem]"></i>`;
+            if (forecast.includes('snow') || forecast.includes('ice') || forecast.includes('flurries')) return `<i class="ph-fill ph-cloud-snow text-blue-300 text-[2rem]"></i>`;
+            if (forecast.includes('cloud') || forecast.includes('overcast')) return `<i class="ph-fill ph-cloud text-slate-400 dark:text-slate-500 text-[2rem]"></i>`;
+            if (forecast.includes('sun') || forecast.includes('clear')) return isDaytime ? `<i class="ph-fill ph-sun text-yellow-400 text-[2rem]"></i>` : `<i class="ph-fill ph-moon text-indigo-300 text-[2rem]"></i>`;
+            return isDaytime ? `<i class="ph-fill ph-sun text-yellow-400 text-[2rem]"></i>` : `<i class="ph-fill ph-moon text-indigo-300 text-[2rem]"></i>`;
+        };
+
+        const renderHeader = () => {
+            let recentHTML = '';
+            if (state.recentSearches.length > 0) {
+                recentHTML = `
+                    <div class="flex flex-wrap items-center justify-center md:justify-end gap-2 mt-3 w-full">
+                        <span class="text-xs text-slate-400 dark:text-slate-500 font-medium mr-1"><i class="ph ph-clock-counter-clockwise mr-1"></i>Recent:</span>
+                        ${state.recentSearches.map(s => `
+                            <button onclick="loadRecentSearch('${s.zip}')" class="text-xs font-semibold px-2.5 py-1 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-full transition-colors">
+                                ${s.name}
+                            </button>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            return `
+            <header class="bg-white dark:bg-slate-850 rounded-2xl shadow-sm p-6 md:p-8 border border-slate-100 dark:border-slate-800 flex flex-col md:flex-row items-center justify-between gap-6 fade-in relative transition-colors duration-300">
+                <div class="text-center md:text-left flex flex-col h-full justify-between">
+                    <div>
+                        <h1 class="text-3xl font-bold text-blue-900 dark:text-blue-100 tracking-tight flex items-center justify-center md:justify-start gap-2">
+                            <i class="ph-fill ph-sun text-yellow-500 text-[1.1em]"></i>
+                            NWS Explorer: CA Edition
+                        </h1>
+                        <p class="text-slate-500 dark:text-slate-400 text-sm font-medium mt-1">California-Focused Weather & Climate</p>
+                    </div>
+                    
+                    <!-- NEW: Settings Toggles -->
+                    <div class="flex items-center justify-center md:justify-start gap-3 mt-4">
+                        <button onclick="toggleTheme()" class="flex items-center justify-center w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors" title="Toggle Dark Mode">
+                            ${state.isDark ? '<i class="ph-fill ph-sun"></i>' : '<i class="ph-fill ph-moon"></i>'}
+                        </button>
+                        <button onclick="toggleUnit()" class="flex items-center justify-center px-3 h-8 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors font-bold text-xs" title="Switch Units">
+                            ${state.unit === 'F' ? 'Switch to °C' : 'Switch to °F'}
+                        </button>
+                    </div>
+                </div>
+
+                <div class="w-full md:w-auto flex flex-col items-end">
+                    <form onsubmit="handleSearch(event)" class="w-full md:w-auto relative flex gap-2">
+                        <button type="button" onclick="geolocateUser()" class="shrink-0 p-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-xl transition-colors border border-slate-200 dark:border-slate-700" title="Use current location">
+                            <i class="ph-fill ph-navigation-arrow text-lg"></i>
+                        </button>
+                        <button type="button" onclick="toggleMap()" class="shrink-0 p-3 bg-slate-100 dark:bg-slate-800 hover:bg-blue-100 dark:hover:bg-blue-900 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-xl transition-colors border border-slate-200 dark:border-slate-700 ${state.showMap ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-800' : ''}" title="Choose on map">
+                            <i class="ph-fill ph-map-trifold text-lg"></i>
+                        </button>
+                        <div class="relative group w-full md:w-80">
+                            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                <i class="ph ph-magnifying-glass text-xl text-slate-400 dark:text-slate-500 group-focus-within:text-blue-500 transition-colors"></i>
+                            </div>
+                            <input
+                                id="zip-input" type="text" value="${state.zipCode}" placeholder="Enter US Zip Code..."
+                                class="block w-full pl-10 pr-24 py-3 border border-slate-200 dark:border-slate-700 rounded-xl leading-5 bg-slate-50 dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 text-slate-700 dark:text-slate-100 transition-all sm:text-sm font-medium"
+                                maxlength="5"
+                            />
+                            <button type="submit" ${state.loading ? 'disabled' : ''} class="absolute inset-y-1 right-1 px-4 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors flex items-center justify-center">
+                                ${state.loading ? '<i class="ph ph-spinner ph-spin text-lg"></i>' : 'Search'}
+                            </button>
+                        </div>
+                    </form>
+                    ${recentHTML}
+                </div>
+            </header>
+            
+            <!-- NEW: Map UI with Radar Overlay Controls -->
+            ${state.showMap ? `
+            <div class="bg-white dark:bg-slate-850 p-2 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-800 mt-2 fade-in relative z-50">
+                <div class="flex justify-between items-center px-4 pt-2 pb-3">
+                    <h3 class="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                        <i class="ph-fill ph-map-pin text-blue-500"></i> Location & Radar Map
+                    </h3>
+                    <button onclick="toggleMap()" class="text-slate-400 hover:text-red-500 transition-colors"><i class="ph ph-x text-xl"></i></button>
+                </div>
+                
+                <div class="relative rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-900">
+                    <div id="map-container" class="w-full h-[450px] z-0"></div>
+                    
+                    <!-- Radar Controls Overlay -->
+                    <div class="absolute bottom-4 left-4 z-[500] bg-white/90 dark:bg-slate-800/90 backdrop-blur p-2.5 rounded-xl flex items-center gap-4 shadow-lg border border-slate-200 dark:border-slate-700 pointer-events-auto">
+                        <button onclick="toggleRadarPlay()" class="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors" title="Play/Pause Rain Radar">
+                            <i id="radar-play-icon" class="ph-fill ${state.radarPlaying ? 'ph-pause' : 'ph-play'} text-blue-600 dark:text-blue-400 text-xl"></i>
+                        </button>
+                        <div class="flex flex-col">
+                            <span class="text-[10px] uppercase tracking-wider font-bold text-slate-400 dark:text-slate-500 leading-none">Past 2 Hours</span>
+                            <span id="radar-time" class="text-sm font-bold text-slate-700 dark:text-slate-200">--:--</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <p class="text-xs text-slate-500 text-center mt-3 mb-1 font-medium">Click anywhere on the map to load the forecast. Radar overlay provided by RainViewer.</p>
+            </div>
+            ` : ''}
+            `;
+        };
+
+        const renderNav = () => `
+            <div class="flex gap-2 p-1 bg-white dark:bg-slate-850 rounded-xl shadow-sm border border-slate-100 dark:border-slate-800 w-fit mx-auto md:mx-0 fade-in transition-colors duration-300">
+                <button onclick="setMainTab('forecast')" class="px-8 py-2.5 rounded-lg text-sm font-semibold transition-colors ${state.mainTab === 'forecast' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'}">
+                    Live Forecast
+                </button>
+                <button onclick="setMainTab('education')" class="px-8 py-2.5 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2 ${state.mainTab === 'education' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'}">
+                    <i class="ph-fill ph-book-open text-lg"></i>
+                    CA Weather Guide
+                </button>
+            </div>
+        `;
+
+        const renderForecastView = () => {
+            let html = '<div class="space-y-8 fade-in">';
+            
+            if (state.error) {
+                html += `
+                <div class="bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500 p-4 rounded-r-lg flex items-start gap-3">
+                    <i class="ph-fill ph-warning text-red-500 text-xl mt-0.5"></i>
+                    <p class="text-red-700 dark:text-red-400 text-sm font-medium">${state.error}</p>
+                </div>`;
+            }
+
+            if (state.currentWeather) {
+                html += `
+                <div class="bg-gradient-to-br from-blue-600 to-indigo-800 dark:from-blue-900 dark:to-slate-900 rounded-3xl p-6 md:p-10 text-white shadow-xl relative overflow-hidden slide-up">
+                    <div class="absolute top-0 right-0 w-64 h-64 bg-white opacity-5 rounded-full -translate-y-1/2 translate-x-1/4 blur-3xl pointer-events-none"></div>
+                    <div class="relative z-10 flex flex-col md:flex-row items-center justify-between gap-8">
+                        <div class="flex flex-col gap-4 text-center md:text-left w-full md:w-auto">
+                            <div class="flex items-center justify-center md:justify-start gap-2 text-blue-100 bg-white/10 px-4 py-1.5 rounded-full w-fit text-sm font-medium backdrop-blur-sm mx-auto md:mx-0 border border-white/10">
+                                <i class="ph-fill ph-map-pin text-base"></i>
+                                ${state.locationName}
+                            </div>
+                            <div class="flex items-end justify-center md:justify-start gap-4">
+                                <h2 class="text-6xl md:text-8xl font-bold tracking-tighter">${window.getTemp(state.currentWeather.temperature)}°<span class="text-3xl md:text-5xl opacity-80">${state.unit}</span></h2>
+                                <div class="pb-2 md:pb-4 text-left">
+                                    <p class="text-2xl md:text-3xl font-medium">${state.currentWeather.shortForecast}</p>
+                                    <p class="text-blue-100 flex items-center justify-center md:justify-start gap-1.5 mt-1 text-sm md:text-base">
+                                        <i class="ph-fill ph-wind text-base"></i>
+                                        ${state.currentWeather.windSpeed} ${state.currentWeather.windDirection}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="p-6 bg-white/10 rounded-2xl backdrop-blur-md border border-white/20 flex flex-col items-center justify-center w-32 h-32 md:w-40 md:h-40 shrink-0 shadow-inner">
+                            <div class="transform scale-150 drop-shadow-md">
+                                ${getWeatherIconHTML(state.currentWeather.shortForecast, state.currentWeather.isDaytime)}
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+            }
+
+            if (state.loading) {
+                html += `
+                <div class="bg-white dark:bg-slate-850 rounded-3xl shadow-sm border border-slate-100 dark:border-slate-800 p-16 flex flex-col items-center justify-center text-center fade-in transition-colors">
+                    <i class="ph ph-spinner ph-spin text-blue-500 text-5xl mb-4"></i>
+                    <p class="text-lg text-slate-600 dark:text-slate-300 font-semibold">Analyzing Atmosphere...</p>
+                    <p class="text-sm text-slate-400 dark:text-slate-500 mt-1 font-medium">Fetching latest NWS data</p>
+                </div>`;
+            }
+
+            if (!state.loading && state.forecast) {
+                html += `
+                <div class="flex gap-2 p-1 bg-white dark:bg-slate-850 rounded-xl shadow-sm border border-slate-100 dark:border-slate-800 w-fit flex-wrap slide-up transition-colors">
+                    <button onclick="setActiveTab('daily')" class="px-6 py-2 rounded-lg text-sm font-semibold transition-colors ${state.activeTab === 'daily' ? 'bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}">7-Day Forecast</button>
+                    <button onclick="setActiveTab('hourly')" class="px-6 py-2 rounded-lg text-sm font-semibold transition-colors ${state.activeTab === 'hourly' ? 'bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}">24-Hour Graph</button>
+                    <button onclick="setActiveTab('climate')" class="px-6 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2 ${state.activeTab === 'climate' ? 'bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}">
+                        <i class="ph-fill ph-calendar-blank"></i> CPC Seasonal Outlooks
+                    </button>
+                </div>
+                <div class="bg-white dark:bg-slate-850 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-800 p-6 slide-up transition-colors">`;
+
+                if (state.activeTab === 'daily') {
+                    html += `<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">`;
+                    state.forecast.daily.forEach(period => {
+                        const pop = period.probabilityOfPrecipitation?.value > 0 ? 
+                            `<div class="flex items-center gap-1"><i class="ph-fill ph-drop text-blue-400"></i> ${period.probabilityOfPrecipitation.value}%</div>` : '';
+                        
+                        html += `
+                        <div class="p-5 rounded-xl border border-slate-100 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 hover:shadow-md transition-all group flex flex-col justify-between">
+                            <div class="flex justify-between items-start mb-4">
+                                <div>
+                                    <h4 class="font-bold text-slate-800 dark:text-slate-200">${period.name}</h4>
+                                    <div class="flex items-center gap-1 mt-1">
+                                        <span class="text-2xl font-black text-blue-900 dark:text-blue-400">${window.getTemp(period.temperature)}°</span>
+                                    </div>
+                                </div>
+                                <div class="p-2 bg-blue-50 dark:bg-slate-800 rounded-lg group-hover:scale-110 transition-transform">
+                                    ${getWeatherIconHTML(period.shortForecast, period.isDaytime)}
+                                </div>
+                            </div>
+                            <div class="space-y-3">
+                                <p class="text-sm font-semibold text-slate-700 dark:text-slate-300">${period.shortForecast}</p>
+                                <div class="flex items-center gap-4 text-xs font-semibold text-slate-500 dark:text-slate-400">
+                                    ${pop}
+                                    <div class="flex items-center gap-1"><i class="ph-fill ph-wind text-slate-400"></i> ${period.windSpeed}</div>
+                                </div>
+                                <p class="text-xs text-slate-500 dark:text-slate-400 font-medium leading-relaxed border-t border-slate-200 dark:border-slate-700 pt-3 mt-3">
+                                    ${period.detailedForecast}
+                                </p>
+                            </div>
+                        </div>`;
+                    });
+                    html += `</div>`;
+                }
+
+                // NEW: Hourly Visual Chart Implementation
+                if (state.activeTab === 'hourly') {
+                    html += `
+                    <div class="w-full flex flex-col space-y-6">
+                        <div class="flex justify-between items-end mb-2">
+                            <h3 class="text-lg font-bold text-slate-800 dark:text-slate-200">Temperature Trend</h3>
+                            <span class="text-xs font-bold text-slate-500 bg-slate-100 dark:bg-slate-800 px-3 py-1 rounded-full border border-slate-200 dark:border-slate-700">Next 24 Hours</span>
+                        </div>
+                        <div class="w-full h-72 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-100 dark:border-slate-800 p-4">
+                            <canvas id="hourlyChartCanvas"></canvas>
+                        </div>
+                        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
+                            ${state.forecast.hourly.slice(0, 6).map((hour, i) => `
+                                <div class="flex flex-col items-center justify-center p-3 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-100 dark:border-slate-700">
+                                    <span class="text-xs font-bold text-slate-500 mb-1">${i===0 ? 'Now' : new Date(hour.startTime).toLocaleTimeString([], {hour: 'numeric'})}</span>
+                                    <div class="transform scale-75">${getWeatherIconHTML(hour.shortForecast, hour.isDaytime)}</div>
+                                    <span class="font-bold mt-1 text-slate-800 dark:text-slate-200">${window.getTemp(hour.temperature)}°</span>
+                                    ${hour.probabilityOfPrecipitation?.value > 0 ? `<span class="text-[10px] font-bold text-blue-500 mt-1"><i class="ph-fill ph-drop"></i> ${hour.probabilityOfPrecipitation.value}%</span>` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                    `;
+                }
+                
+                if (state.activeTab === 'climate') {
+                    if (!state.cpcOutlooks) {
+                        html += `
+                        <div class="text-center p-10 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800">
+                            <i class="ph ph-chart-bar text-5xl text-slate-400 dark:text-slate-500 mx-auto mb-3"></i>
+                            <h3 class="text-lg font-semibold text-slate-700 dark:text-slate-300">Outlooks Unavailable</h3>
+                            <p class="text-slate-500 dark:text-slate-400 mt-2 max-w-md mx-auto">Official NOAA Climate Prediction Center seasonal outlooks are currently not available for this location or the service is temporarily offline.</p>
+                        </div>`;
+                    } else {
+                        html += `
+                        <div class="space-y-6">
+                            <div class="flex overflow-x-auto pb-4 gap-3 snap-x hide-scrollbar">
+                                ${state.cpcOutlooks.map((outlook, index) => `
+                                    <button onclick="setSelectedClimateMonth(${index})" class="shrink-0 min-w-fit px-4 py-3 rounded-xl border flex flex-col items-center text-center snap-center transition-all ${state.selectedClimateMonth === index ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' : 'bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-indigo-50 dark:hover:bg-slate-800 hover:border-indigo-200'}">
+                                        <span class="text-xs font-semibold mb-1 whitespace-nowrap ${state.selectedClimateMonth === index ? 'text-indigo-100' : 'text-slate-400 dark:text-slate-500'}">${outlook.year}</span>
+                                        <span class="text-base md:text-lg font-bold whitespace-nowrap tracking-tight">${outlook.shortName}</span>
+                                    </button>
+                                `).join('')}
+                            </div>
+                            
+                            <div class="bg-slate-50 dark:bg-slate-900 rounded-2xl p-6 md:p-8 border border-slate-100 dark:border-slate-800">
+                                <div class="flex flex-col gap-6">
+                                    <div class="flex items-center gap-3 border-b border-slate-200 dark:border-slate-700 pb-4">
+                                        <div class="p-3 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400 rounded-xl">
+                                            <i class="ph-fill ph-calendar-blank text-2xl"></i>
+                                        </div>
+                                        <div>
+                                            <h3 class="text-2xl font-bold text-slate-800 dark:text-slate-200">${state.cpcOutlooks[state.selectedClimateMonth].title}</h3>
+                                            <p class="text-sm text-slate-500 dark:text-slate-400 font-medium">3-Month Seasonal Outlook</p>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
+                                        <div class="p-6 rounded-xl border shadow-sm flex flex-col ${getCatColor(state.cpcOutlooks[state.selectedClimateMonth].temp.cat, 'temp')}">
+                                            <div class="flex items-center gap-2 font-semibold mb-3">
+                                                <i class="ph-fill ph-thermometer text-xl"></i> Temperature
+                                            </div>
+                                            <span class="text-3xl font-bold mb-1 tracking-tight">${state.cpcOutlooks[state.selectedClimateMonth].temp.cat}</span>
+                                            ${state.cpcOutlooks[state.selectedClimateMonth].temp.prob ? `<span class="text-sm font-medium opacity-80 mb-4 bg-white/40 dark:bg-black/20 px-2 py-1 rounded w-fit">${state.cpcOutlooks[state.selectedClimateMonth].temp.prob}% Probability</span>` : ''}
+                                            <p class="text-sm mt-auto font-medium leading-relaxed">${state.cpcOutlooks[state.selectedClimateMonth].temp.description}</p>
+                                        </div>
+                                        
+                                        <div class="p-6 rounded-xl border shadow-sm flex flex-col ${getCatColor(state.cpcOutlooks[state.selectedClimateMonth].precip.cat, 'precip')}">
+                                            <div class="flex items-center gap-2 font-semibold mb-3">
+                                                <i class="ph-fill ph-drop text-xl"></i> Precipitation
+                                            </div>
+                                            <span class="text-3xl font-bold mb-1 tracking-tight">${state.cpcOutlooks[state.selectedClimateMonth].precip.cat}</span>
+                                            ${state.cpcOutlooks[state.selectedClimateMonth].precip.prob ? `<span class="text-sm font-medium opacity-80 mb-4 bg-white/40 dark:bg-black/20 px-2 py-1 rounded w-fit">${state.cpcOutlooks[state.selectedClimateMonth].precip.prob}% Probability</span>` : ''}
+                                            <p class="text-sm mt-auto font-medium leading-relaxed">${state.cpcOutlooks[state.selectedClimateMonth].precip.description}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="flex items-start md:items-center gap-3 text-xs text-indigo-700 dark:text-indigo-300 bg-indigo-50/50 dark:bg-indigo-900/20 p-4 rounded-xl border border-indigo-100 dark:border-indigo-800/50">
+                                <i class="ph ph-chart-bar text-xl shrink-0 mt-0.5 md:mt-0"></i>
+                                <p>Data provided directly by the <strong>NOAA Climate Prediction Center (CPC)</strong>. These outlooks indicate the probability of 3-month seasonal averages being Above, Near, or Below historical norms. "Equal Chances" indicates no strong climate signal pointing in either direction.</p>
+                            </div>
+                        </div>
+                        `;
+                    }
+                }
+
+                html += `</div>
+                <p class="text-xs font-medium text-center text-slate-400 dark:text-slate-500 pt-4">Data provided by the National Weather Service (weather.gov) API</p>
+                `;
+            }
+            
+            html += '</div>';
+            return html;
+        };
+
+        const renderEducationView = () => `
+            <div class="space-y-6 slide-up">
+                <div class="bg-gradient-to-br from-emerald-700 to-teal-900 dark:from-emerald-900 dark:to-slate-900 rounded-3xl p-8 md:p-10 text-white shadow-xl relative overflow-hidden border border-emerald-800/50">
+                    <div class="absolute -top-24 -right-24 w-64 h-64 bg-white opacity-10 rounded-full blur-3xl pointer-events-none"></div>
+                    <div class="relative z-10 max-w-2xl">
+                        <h2 class="text-4xl md:text-5xl font-black tracking-tight mb-4">Understanding California Weather</h2>
+                        <p class="text-teal-100 text-lg font-medium leading-relaxed">California's unique geography creates some of the most fascinating and complex weather patterns in the world. Explore the mechanics behind our climate.</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="bg-white dark:bg-slate-850 rounded-2xl p-7 border border-slate-100 dark:border-slate-800 shadow-sm hover:shadow-md transition-shadow">
+                        <div class="w-12 h-12 bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 rounded-xl flex items-center justify-center mb-5">
+                            <i class="ph-fill ph-waves text-2xl"></i>
+                        </div>
+                        <h3 class="text-xl font-black text-slate-800 dark:text-slate-200 mb-2">The Marine Layer</h3>
+                        <h4 class="text-sm font-bold text-blue-600 dark:text-blue-400 mb-3 tracking-wide uppercase">"May Gray" & "June Gloom"</h4>
+                        <p class="text-slate-600 dark:text-slate-400 leading-relaxed text-sm font-medium">A marine layer develops over the ocean in the presence of a temperature inversion. Cold Pacific currents chill the air above the water, while high pressure aloft traps this cool, moist air near the surface, creating coastal morning fog that usually burns off by afternoon.</p>
+                    </div>
+
+                    <div class="bg-white dark:bg-slate-850 rounded-2xl p-7 border border-slate-100 dark:border-slate-800 shadow-sm hover:shadow-md transition-shadow">
+                        <div class="w-12 h-12 bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 rounded-xl flex items-center justify-center mb-5">
+                            <i class="ph-fill ph-fire text-2xl"></i>
+                        </div>
+                        <h3 class="text-xl font-black text-slate-800 dark:text-slate-200 mb-2">Santa Ana Winds</h3>
+                        <h4 class="text-sm font-bold text-red-600 dark:text-red-400 mb-3 tracking-wide uppercase">Extreme Fire Weather</h4>
+                        <p class="text-slate-600 dark:text-slate-400 leading-relaxed text-sm font-medium">Santa Ana winds are strong, dry downslope winds originating inland. As high pressure forces this air over and down the SoCal mountains, it compresses, heats up, and strips away humidity. Occurring mainly in fall and winter, they create critical fire danger.</p>
+                    </div>
+
+                    <div class="bg-white dark:bg-slate-850 rounded-2xl p-7 border border-slate-100 dark:border-slate-800 shadow-sm hover:shadow-md transition-shadow">
+                        <div class="w-12 h-12 bg-emerald-100 dark:bg-emerald-900/50 text-emerald-600 dark:text-emerald-400 rounded-xl flex items-center justify-center mb-5">
+                            <i class="ph-fill ph-map-trifold text-2xl"></i>
+                        </div>
+                        <h3 class="text-xl font-black text-slate-800 dark:text-slate-200 mb-2">Complex Microclimates</h3>
+                        <h4 class="text-sm font-bold text-emerald-600 dark:text-emerald-400 mb-3 tracking-wide uppercase">Coast, Valley, Mountain, Desert</h4>
+                        <p class="text-slate-600 dark:text-slate-400 leading-relaxed text-sm font-medium">California features massive mountain ranges immediately adjacent to a cold ocean, creating famous microclimates. Weather conditions can change drastically over just a few miles. In summer, coastal cities often experience mild 70°F (21°C) temperatures while inland valleys just 20 miles east bake in 100°F (38°C) heat due to mountains blocking the cool marine air.</p>
+                    </div>
+
+                    <div class="bg-white dark:bg-slate-850 rounded-2xl p-7 border border-slate-100 dark:border-slate-800 shadow-sm hover:shadow-md transition-shadow">
+                        <div class="w-12 h-12 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400 rounded-xl flex items-center justify-center mb-5">
+                            <i class="ph-fill ph-globe-hemisphere-west text-2xl"></i>
+                        </div>
+                        <h3 class="text-xl font-black text-slate-800 dark:text-slate-200 mb-2">El Niño & ENSO</h3>
+                        <h4 class="text-sm font-bold text-indigo-600 dark:text-indigo-400 mb-3 tracking-wide uppercase">Current 2026-2027 Outlook</h4>
+                        <p class="text-slate-600 dark:text-slate-400 leading-relaxed text-sm font-medium">The El Niño-Southern Oscillation (ENSO) cycle dictates Pacific Ocean temperatures and heavily influences California winters. According to the latest NOAA updates in August 2026, an <strong>El Niño Advisory</strong> is in effect, forecasting a high likelihood of a strong event during the winter, which historically increases the chances of a very wet winter in Southern California.</p>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const renderApp = () => {
+            const app = document.getElementById('app');
+            app.innerHTML = `
+                ${renderHeader()}
+                ${renderNav()}
+                ${state.mainTab === 'forecast' ? renderForecastView() : renderEducationView()}
+            `;
+        };
+
+        // Initialize App
+        document.addEventListener('DOMContentLoaded', () => {
+            renderApp();
+            window.handleSearch(); // Fetch for default zip
+        });
+    </script>
+</body>
+</html>
